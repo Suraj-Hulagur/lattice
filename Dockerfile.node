@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY node/ ./node/
+COPY common/ ./common/
+
+ENV PYTHONPATH=/app
+
+# Default port inside container, mapped or accessed via docker network
+CMD ["uvicorn", "node.main:app", "--host", "0.0.0.0", "--port", "8000"]

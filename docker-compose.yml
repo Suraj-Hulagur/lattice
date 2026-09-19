@@ -1,0 +1,106 @@
+version: '3.8'
+
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    ports:
+      - "9700:9700"
+    volumes:
+      - ./coordinator:/app/coordinator
+      - ./common:/app/common
+    networks:
+      - lattice_net
+
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    volumes:
+      - ./node:/app/node
+      - ./common:/app/common
+      - ./data/node1:/app/data
+    networks:
+      - lattice_net
+
+  node2:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    volumes:
+      - ./node:/app/node
+      - ./common:/app/common
+      - ./data/node2:/app/data
+    networks:
+      - lattice_net
+
+  node3:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    volumes:
+      - ./node:/app/node
+      - ./common:/app/common
+      - ./data/node3:/app/data
+    networks:
+      - lattice_net
+
+  node4:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    volumes:
+      - ./node:/app/node
+      - ./common:/app/common
+      - ./data/node4:/app/data
+    networks:
+      - lattice_net
+
+  node5:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    volumes:
+      - ./node:/app/node
+      - ./common:/app/common
+      - ./data/node5:/app/data
+    networks:
+      - lattice_net
+
+  node6:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    volumes:
+      - ./node:/app/node
+      - ./common:/app/common
+      - ./data/node6:/app/data
+    networks:
+      - lattice_net
+
+  node7:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    volumes:
+      - ./node:/app/node
+      - ./common:/app/common
+      - ./data/node7:/app/data
+    networks:
+      - lattice_net
+
+  node8:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    volumes:
+      - ./node:/app/node
+      - ./common:/app/common
+      - ./data/node8:/app/data
+    networks:
+      - lattice_net
+
+networks:
+  lattice_net:
+    driver: bridge
