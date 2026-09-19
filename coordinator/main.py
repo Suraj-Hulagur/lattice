@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 import httpx
+import os
 from common.models import NodeInfo, NodeState
 
 app = FastAPI(title="LATTICE Coordinator")
@@ -21,7 +22,7 @@ def read_root():
 def get_nodes():
     return nodes
 
-@app.post("/test-ping")
+@app.get("/test-ping")
 async def test_ping(node_id: str):
     """Test endpoint to manually trigger a ping from coordinator to a node"""
     if node_id not in nodes:
@@ -39,3 +40,57 @@ async def test_ping(node_id: str):
                 return {"status": "failed", "node": node_id, "status_code": response.status_code}
     except Exception as e:
         return {"status": "error", "node": node_id, "detail": str(e)}
+
+from fastapi import UploadFile, File
+from fastapi.responses import StreamingResponse
+
+@app.put("/objects/{object_name}")
+async def upload_object(object_name: str, file: UploadFile = File(...)):
+    """Upload an object. Temporarily hardcoded to node1 for Phase 3 testing."""
+    node_address = "node1:8000"  # Will be replaced by hashing in Phase 4
+    
+    # In a local test environment without docker, 'node1' won't resolve,
+    # so we fallback to localhost if it's node1
+    if "node1" in node_address and not os.environ.get("DOCKER_ENV"):
+        node_address = "localhost:8000"
+        
+    url = f"http://{node_address}/data/{object_name}"
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            # We stream the file content to the node
+            response = await client.put(
+                url, 
+                files={"file": (file.filename, file.file, file.content_type)}
+            )
+            if response.status_code == 200:
+                return {"message": "Object uploaded successfully", "node": node_address, "object_name": object_name}
+            else:
+                raise HTTPException(status_code=response.status_code, detail=response.text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload to node: {str(e)}")
+
+@app.get("/objects/{object_name}")
+async def download_object(object_name: str):
+    """Download an object. Temporarily hardcoded to node1 for Phase 3 testing."""
+    node_address = "node1:8000"
+    
+    if "node1" in node_address and not os.environ.get("DOCKER_ENV"):
+        node_address = "localhost:8000"
+        
+    url = f"http://{node_address}/data/{object_name}"
+    
+    # Use StreamingResponse to proxy the file back to the client
+    client = httpx.AsyncClient()
+    req = client.build_request("GET", url)
+    r = await client.send(req, stream=True)
+    if r.status_code != 200:
+        await r.aclose()
+        raise HTTPException(status_code=r.status_code, detail="Object not found on node")
+        
+    return StreamingResponse(
+        r.aiter_raw(), 
+        headers={"Content-Disposition": f"attachment; filename={object_name}"},
+        background=r.aclose
+    )
+
