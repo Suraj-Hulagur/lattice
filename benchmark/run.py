@@ -278,6 +278,80 @@ def print_report(summary, sizes, modes):
     print("use SIMD tables; the shape of the trade-off is what this shows.")
 
 
+# ---------------------------------------------------------------------- runner
+
+
+def run_benchmark(
+    coordinator_url=COORDINATOR,
+    sizes=None,
+    reps=5,
+    warmup=1,
+    modes=None,
+    out=DEFAULT_OUT,
+    verbose=False,
+    progress_callback=None,
+):
+    """Execute benchmark against coordinator_url, optionally write CSV to out, and return results.
+
+    progress_callback, if provided, is called with (message_str, progress_float_0_to_1).
+    """
+    if sizes is None:
+        sizes = [parse_size(s) for s in ["16KB", "64KB", "256KB"]]
+    elif isinstance(sizes, str):
+        sizes = [parse_size(s) for s in sizes.split(",") if s.strip()]
+    else:
+        sizes = [parse_size(s) if isinstance(s, str) else s for s in sizes]
+
+    if modes is None:
+        modes = ["replication", "ec"]
+    elif isinstance(modes, str):
+        modes = [m.strip() for m in modes.split(",") if m.strip()]
+
+    coordinator = Coordinator(coordinator_url)
+    state = coordinator.health()
+
+    total_cells = len(sizes) * len(modes)
+    current_cell = 0
+    rows = []
+
+    for size in sizes:
+        for mode in modes:
+            current_cell += 1
+            if progress_callback:
+                progress_callback(
+                    f"Measuring {mode} ({human_size(size)})... [cell {current_cell}/{total_cells}]",
+                    (current_cell - 1) / max(1, total_cells),
+                )
+            if verbose:
+                print(f"  measuring {mode:<12} {human_size(size):>7} ...", end="", flush=True)
+            started = time.perf_counter()
+            cell_rows = measure(coordinator, mode, size, reps, warmup, verbose)
+            rows.extend(cell_rows)
+            if verbose:
+                print(f" {time.perf_counter() - started:5.1f}s")
+
+    if progress_callback:
+        progress_callback("Saving benchmark results...", 1.0)
+
+    if out:
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        with open(out, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = summarise(rows)
+    return {
+        "rows": rows,
+        "summary": summary,
+        "sizes": sizes,
+        "modes": modes,
+        "state": state,
+        "out": out,
+        "timestamp": time.time(),
+    }
+
+
 # ---------------------------------------------------------------------- main
 
 
@@ -307,10 +381,7 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    sizes = [parse_size(s) for s in args.sizes.split(",") if s.strip()]
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     coordinator = Coordinator(args.coordinator)
-
     try:
         state = coordinator.health()
     except requests.RequestException as e:
@@ -326,22 +397,18 @@ def main():
     print(f"coordinator {args.coordinator}, {state['healthy']}/8 nodes healthy")
     print(f"{args.reps} reps per cell, {args.warmup} warmup pass(es), seed {SEED}")
 
-    rows = []
-    for size in sizes:
-        for mode in modes:
-            print(f"  measuring {mode:<12} {human_size(size):>7} ...", end="", flush=True)
-            started = time.perf_counter()
-            rows += measure(coordinator, mode, size, args.reps, args.warmup, args.verbose)
-            print(f" {time.perf_counter() - started:5.1f}s")
+    result = run_benchmark(
+        coordinator_url=args.coordinator,
+        sizes=[parse_size(s) for s in args.sizes.split(",") if s.strip()],
+        reps=args.reps,
+        warmup=args.warmup,
+        modes=[m.strip() for m in args.modes.split(",") if m.strip()],
+        out=args.out,
+        verbose=args.verbose,
+    )
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with open(args.out, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print_report(summarise(rows), sizes, modes)
-    print(f"{len(rows)} measurements written to {args.out}")
+    print_report(result["summary"], result["sizes"], result["modes"])
+    print(f"{len(result['rows'])} measurements written to {args.out}")
     print("The dashboard picks this file up on its Benchmark tab.")
     return 0
 

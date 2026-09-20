@@ -11,6 +11,7 @@ tells ordinary callers.
 
 import io
 import os
+import sys
 import time
 
 import pandas as pd
@@ -20,6 +21,11 @@ import streamlit as st
 DEFAULT_COORDINATOR = os.environ.get("LATTICE_COORDINATOR", "http://localhost:9700")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_RESULTS = os.path.join(REPO_ROOT, "benchmark", "results.csv")
+
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from benchmark.run import run_benchmark
 
 STATE_STYLE = {
     "healthy": ("#1a7f37", "HEALTHY"),
@@ -284,18 +290,118 @@ def objects_pane(api, health):
             st.error(f"{e.response.status_code}: {e.response.text}")
 
 
-def benchmark_pane(results_path):
-    st.markdown("#### Benchmark results")
-    st.caption(f"Reading {results_path} -- produced by `python benchmark/run.py`.")
+def benchmark_pane(results_path, base_url=DEFAULT_COORDINATOR):
+    st.markdown("#### Live Cluster Benchmark")
+    st.caption(
+        "Execute a fresh benchmark against the running LATTICE cluster or inspect saved/uploaded results."
+    )
+
+    with st.expander("Benchmark Configuration & Controls", expanded=True):
+        col1, col2, col3 = st.columns([2, 2, 1])
+        with col1:
+            sizes_input = st.text_input(
+                "Payload Sizes",
+                value="16KB,64KB,256KB",
+                help="Comma-separated sizes (e.g. 16KB,64KB,256KB,1MB)",
+                key="bench-sizes-input",
+            )
+        with col2:
+            modes_selected = st.multiselect(
+                "Storage Modes",
+                options=["replication", "ec"],
+                default=["replication", "ec"],
+                help="Storage modes to test",
+                key="bench-modes-select",
+            )
+        with col3:
+            reps_count = st.number_input(
+                "Reps / Cell",
+                min_value=1,
+                max_value=20,
+                value=3,
+                help="Measured repetitions per cell",
+                key="bench-reps-input",
+            )
+
+        run_btn = st.button("Run Benchmark", type="primary", use_container_width=True, key="do-benchmark")
+
+    if run_btn:
+        if not modes_selected:
+            st.error("Please select at least one storage mode to benchmark.")
+        else:
+            with st.status(f"Running benchmark against `{base_url}`...", expanded=True) as status_box:
+                progress_bar = st.progress(0.0)
+
+                def on_progress(msg, fraction):
+                    status_box.write(msg)
+                    progress_bar.progress(min(1.0, max(0.0, fraction)))
+
+                try:
+                    sizes_list = [s.strip() for s in sizes_input.split(",") if s.strip()]
+                    result = run_benchmark(
+                        coordinator_url=base_url,
+                        sizes=sizes_list,
+                        reps=int(reps_count),
+                        warmup=1,
+                        modes=modes_selected,
+                        out=results_path,
+                        verbose=False,
+                        progress_callback=on_progress,
+                    )
+                    progress_bar.progress(1.0)
+                    status_box.update(
+                        label="Benchmark completed successfully!",
+                        state="complete",
+                        expanded=False,
+                    )
+                    st.session_state["benchmark_fresh_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    st.session_state["benchmark_fresh_target"] = base_url
+                    st.session_state["benchmark_fresh_rows"] = len(result["rows"])
+                    st.success(
+                        f"Fresh benchmark completed against {base_url}! "
+                        f"{len(result['rows'])} measurements recorded to `{results_path}`."
+                    )
+                except requests.RequestException as e:
+                    status_box.update(label="Benchmark failed!", state="error", expanded=True)
+                    st.error(f"Benchmark failed: coordinator at {base_url} is unreachable ({e}).")
+                except Exception as e:
+                    status_box.update(label="Benchmark failed!", state="error", expanded=True)
+                    st.error(f"Benchmark failed: {e}")
 
     uploaded = st.file_uploader("Or load a CSV", type="csv", key="bench-csv")
     if uploaded is not None:
         frame = pd.read_csv(io.BytesIO(uploaded.getvalue()))
+        st.caption("Displaying measurements from uploaded CSV.")
     elif os.path.exists(results_path):
         frame = pd.read_csv(results_path)
+        fresh_time = st.session_state.get("benchmark_fresh_time")
+        fresh_target = st.session_state.get("benchmark_fresh_target", base_url)
+        if fresh_time:
+            st.info(f"Displaying fresh benchmark data recorded at **{fresh_time}** against `{fresh_target}`.")
+        else:
+            st.caption(f"Reading `{results_path}` -- produced by `python benchmark/run.py` or previous run.")
     else:
-        st.info("No results yet. Run `python benchmark/run.py` and come back.")
+        st.info("No results yet. Click **'Run Benchmark'** above or run `python benchmark/run.py`.")
         return
+
+    if frame.empty:
+        st.warning("The benchmark result set is empty.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    total_ops = len(frame)
+    all_verified = frame["verified"].all() if "verified" in frame else False
+    c1.metric("Total Measurements", total_ops)
+    c2.metric("Data Integrity", "100% Verified" if all_verified else "Verification Failed")
+    rep_writes = frame[(frame["mode"] == "replication") & (frame["operation"] == "write")]
+    ec_writes = frame[(frame["mode"] == "ec") & (frame["operation"] == "write")]
+    if not rep_writes.empty:
+        c3.metric("Replication Median Write", f"{rep_writes['seconds'].median() * 1000:.1f} ms")
+    if not ec_writes.empty:
+        c4.metric("EC Median Write", f"{ec_writes['seconds'].median() * 1000:.1f} ms")
+
+    st.markdown("---")
+    st.markdown("#### Performance Comparison")
 
     medians = (
         frame.groupby(["mode", "size_bytes", "operation"])["seconds"]
@@ -368,7 +474,7 @@ def main():
         st.error(f"Can't reach the coordinator at {base_url}")
         st.code(str(e))
         st.caption("Start the cluster with:  docker compose up -d --build")
-        benchmark_pane(results_path)
+        benchmark_pane(results_path, base_url=base_url)
         return
 
     cluster_tab, objects_tab, bench_tab = st.tabs(["Cluster", "Objects", "Benchmark"])
@@ -377,7 +483,7 @@ def main():
     with objects_tab:
         objects_pane(api, health)
     with bench_tab:
-        benchmark_pane(results_path)
+        benchmark_pane(results_path, base_url=base_url)
 
     if auto:
         time.sleep(interval)
