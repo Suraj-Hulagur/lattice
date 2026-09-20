@@ -37,7 +37,7 @@ curl -X PUT localhost:9700/objects/report.pdf \
 curl localhost:9700/objects/report.pdf/placement
 ```
 
-## Watching it survive a failure
+## Running method
 
 ```bash
 python chaos/demo.py
@@ -144,15 +144,14 @@ chaos/demo.py            deterministic failure demo
 benchmark/run.py         replication vs EC, to CSV
 dashboard/app.py         Streamlit dashboard
 tests/test_lattice.py    end-to-end tests without Docker
-docs/VIVA.md             the design, and the questions it invites
 ```
 
-## Design notes
+## Implementation Method
 
 **Nothing here is durable across a coordinator restart.** The placement index
 lives in memory. The data survives on the nodes, and a replicated read falls
 back to probing the ring, but an EC object whose shard map is lost cannot be
-reassembled. A real system writes that index down; see `docs/VIVA.md`.
+reassembled. A real system writes that index down; see the Design section below.
 
 **Writes are accepted before they are fully protected.** Replication commits at
 2 of 3 copies, erasure coding at 4 of 6 shards -- in both cases the point at
@@ -170,5 +169,22 @@ decoder inverts the 4x4 submatrix of whichever shards turned up. The tests
 check every one of the 15 four-shard subsets. It is pure Python and slow,
 around 1 MB/s, which is exactly what the benchmark shows.
 
-`docs/VIVA.md` goes through the reasoning, the trade-offs, and the parts that
-would have to change to make this real.
+## A five-minute demo script
+
+```bash
+docker compose up -d --build
+curl localhost:9700/health                       # 8/8 healthy
+
+# the two modes, same object, different shape
+curl -X PUT localhost:9700/objects/a.bin -F file=@test.txt
+curl -X PUT localhost:9700/objects/b.bin -H "X-Storage-Mode: ec" -F file=@test.txt
+curl localhost:9700/objects/a.bin/placement      # 3 nodes
+curl localhost:9700/objects/b.bin/placement      # 6 shards, D1..D4 P1 P2
+
+python chaos/demo.py                             # kill nodes, watch it recover
+python benchmark/run.py                          # the numbers
+streamlit run dashboard/app.py                   # the live picture
+pytest -q                                        # and it's all tested
+```
+
+The single most convincing moment is in the Erasure Coding scenario: two of the six nodes holding an object are stopped, and the very next read returns bytes that hash identically to what was written, reconstructed from four shards—followed a few seconds later by the repair pass rebuilding the two missing shards onto fresh nodes, with no client involvement at all.
