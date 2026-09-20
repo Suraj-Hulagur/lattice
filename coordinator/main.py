@@ -14,6 +14,11 @@ nodes = {
     for i in range(1, 9)
 }
 
+from coordinator.hashing import ConsistentHashRing
+ring = ConsistentHashRing()
+for node_id in nodes:
+    ring.add_node(node_id)
+
 @app.get("/")
 def read_root():
     return {"status": "Coordinator is running"}
@@ -46,12 +51,16 @@ from fastapi.responses import StreamingResponse
 
 @app.put("/objects/{object_name}")
 async def upload_object(object_name: str, file: UploadFile = File(...)):
-    """Upload an object. Temporarily hardcoded to node1 for Phase 3 testing."""
-    node_address = "node1:8000"  # Will be replaced by hashing in Phase 4
+    """Upload an object using consistent hashing."""
+    node_id = ring.get_node(object_name)
+    if not node_id:
+        raise HTTPException(status_code=503, detail="No storage nodes available")
     
-    # In a local test environment without docker, 'node1' won't resolve,
-    # so we fallback to localhost if it's node1
-    if "node1" in node_address and not os.environ.get("DOCKER_ENV"):
+    node_address = nodes[node_id].address
+    
+    # In a local test environment without docker, fallback to localhost
+    if not os.environ.get("DOCKER_ENV"):
+        # Map nodeX:8000 to localhost:8000 for local testing
         node_address = "localhost:8000"
         
     url = f"http://{node_address}/data/{object_name}"
@@ -64,7 +73,7 @@ async def upload_object(object_name: str, file: UploadFile = File(...)):
                 files={"file": (file.filename, file.file, file.content_type)}
             )
             if response.status_code == 200:
-                return {"message": "Object uploaded successfully", "node": node_address, "object_name": object_name}
+                return {"message": "Object uploaded successfully", "node": node_id, "address": node_address, "object_name": object_name}
             else:
                 raise HTTPException(status_code=response.status_code, detail=response.text)
     except Exception as e:
@@ -72,10 +81,14 @@ async def upload_object(object_name: str, file: UploadFile = File(...)):
 
 @app.get("/objects/{object_name}")
 async def download_object(object_name: str):
-    """Download an object. Temporarily hardcoded to node1 for Phase 3 testing."""
-    node_address = "node1:8000"
+    """Download an object using consistent hashing."""
+    node_id = ring.get_node(object_name)
+    if not node_id:
+        raise HTTPException(status_code=503, detail="No storage nodes available")
+        
+    node_address = nodes[node_id].address
     
-    if "node1" in node_address and not os.environ.get("DOCKER_ENV"):
+    if not os.environ.get("DOCKER_ENV"):
         node_address = "localhost:8000"
         
     url = f"http://{node_address}/data/{object_name}"

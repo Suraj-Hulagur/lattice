@@ -7,6 +7,8 @@ services:
       dockerfile: Dockerfile.coordinator
     ports:
       - "9700:9700"
+    environment:
+      - DOCKER_ENV=1
     volumes:
       - ./coordinator:/app/coordinator
       - ./common:/app/common
