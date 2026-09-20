@@ -9,17 +9,36 @@ REPLICATION_FACTOR = 3
 WRITE_QUORUM = 2
 
 
-def select_replicas(ring, object_name: str, nodes: dict, factor: int = REPLICATION_FACTOR) -> list:
-    """Pick `factor` distinct healthy nodes for an object.
+def plan_write(ring, object_name: str, nodes: dict, factor: int = REPLICATION_FACTOR):
+    """Work out where a write should go, and what is standing in for what.
 
-    We ask the ring for a preference list covering every node, then take the
-    healthy ones in ring order. Walking past unhealthy nodes (rather than
-    stopping at them) is what lets a write still succeed while part of the
-    cluster is down.
+    Returns (targets, handoffs). `targets` is the `factor` healthy nodes to
+    write to. `handoffs` pairs each stand-in with the node it is covering for,
+    as (holder, intended_owner) -- the ring wanted the owner, but it wasn't
+    healthy, so the holder took the replica on its behalf.
+
+    Walking past unhealthy nodes (rather than stopping at them) is what lets a
+    write still reach full replication while part of the cluster is down; the
+    handoff pairs are what let those replicas find their way home later.
     """
     preference = ring.get_nodes(object_name, count=len(nodes))
+    ideal = preference[:factor]
     healthy = [node_id for node_id in preference if nodes[node_id].state == NodeState.HEALTHY]
-    return healthy[:factor]
+    targets = healthy[:factor]
+
+    displaced = [node_id for node_id in ideal if node_id not in targets]
+    standins = [node_id for node_id in targets if node_id not in ideal]
+
+    # zip() stops at the shorter list, which is what we want: if the cluster is
+    # too degraded to find a stand-in for every displaced owner, the replicas we
+    # couldn't place simply aren't owed back to anyone.
+    return targets, list(zip(standins, displaced))
+
+
+def select_replicas(ring, object_name: str, nodes: dict, factor: int = REPLICATION_FACTOR) -> list:
+    """Just the write targets, for callers that don't care about handoffs."""
+    targets, _ = plan_write(ring, object_name, nodes, factor)
+    return targets
 
 
 def read_order(ring, object_name: str, nodes: dict) -> list:
