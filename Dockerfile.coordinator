@@ -9,5 +9,8 @@ COPY coordinator/ ./coordinator/
 COPY common/ ./common/
 
 ENV PYTHONPATH=/app
+# Without this, print() from the health/verify loops sits in a block buffer and
+# `docker compose logs` shows nothing until the process exits.
+ENV PYTHONUNBUFFERED=1
 
 CMD ["uvicorn", "coordinator.main:app", "--host", "0.0.0.0", "--port", "9700"]

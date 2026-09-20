@@ -9,6 +9,7 @@ COPY node/ ./node/
 COPY common/ ./common/
 
 ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
 
 # Default port inside container, mapped or accessed via docker network
 CMD ["uvicorn", "node.main:app", "--host", "0.0.0.0", "--port", "8000"]

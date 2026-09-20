@@ -79,7 +79,27 @@ def cluster_health():
             for node_id in nodes
             if health.miss_count(node_id)
         },
+        "verdicts": {
+            node_id: health.last_verdict(node_id)
+            for node_id in nodes
+            if health.last_verdict(node_id)
+        },
     }
+
+
+@app.post("/nodes/{node_id}/verify")
+async def verify_node(node_id: str):
+    """Ask other healthy nodes whether they can reach this one, on demand.
+
+    The same check the sweep runs automatically, exposed so a failure can be
+    corroborated without waiting for the next probe interval.
+    """
+    if node_id not in nodes:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    async with httpx.AsyncClient() as client:
+        verdict = await health.verify_failure(nodes[node_id], nodes, client)
+    return verdict
 
 
 @app.get("/test-ping")
