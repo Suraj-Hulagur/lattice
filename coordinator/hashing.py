@@ -26,17 +26,35 @@ class ConsistentHashRing:
                 del self.ring[key_hash]
                 self.sorted_keys.remove(key_hash)
 
-    def get_node(self, object_name: str) -> str:
+    def get_nodes(self, object_name: str, count: int = 3) -> list:
+        """Walk the ring clockwise and return up to `count` DISTINCT physical nodes.
+
+        Several virtual nodes on the ring map back to the same physical node, so
+        we skip duplicates -- otherwise all 3 'replicas' could land on one box.
+        """
         if not self.ring:
-            return None
-        
+            return []
+
         key_hash = self._hash(object_name)
-        
+
         # Find the first node with a hash greater than or equal to the object's hash
         idx = bisect.bisect_left(self.sorted_keys, key_hash)
-        
+
         # If we went past the end of the ring, wrap around to the first node
         if idx == len(self.sorted_keys):
             idx = 0
-            
-        return self.ring[self.sorted_keys[idx]]
+
+        preference = []
+        total = len(self.sorted_keys)
+        for offset in range(total):
+            node_id = self.ring[self.sorted_keys[(idx + offset) % total]]
+            if node_id not in preference:
+                preference.append(node_id)
+                if len(preference) == count:
+                    break
+        return preference
+
+    def get_node(self, object_name: str) -> str:
+        """The primary node for an object (first entry of the preference list)."""
+        preference = self.get_nodes(object_name, count=1)
+        return preference[0] if preference else None
