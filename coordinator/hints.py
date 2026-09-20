@@ -26,6 +26,13 @@ def drop(object_name: str, intended_owner: str):
     _hints.pop((object_name, intended_owner), None)
 
 
+def drop_object(object_name: str):
+    """Forget every hint for an object. Used when it is rewritten in EC mode,
+    where the replicas the hints point at no longer exist."""
+    for key in [k for k in _hints if k[0] == object_name]:
+        del _hints[key]
+
+
 def for_owner(owner: str) -> list:
     """Every (object_name, holder) currently owed to `owner`."""
     return [

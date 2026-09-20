@@ -3,7 +3,9 @@ uvicorn==0.30.1
 pydantic==2.7.4
 requests==2.32.3
 httpx==0.27.0
-reedsolo==1.7.0
 pytest==8.2.2
 boto3==1.34.131
 python-multipart==0.0.9
+# Reed-Solomon over GF(256) is implemented directly in common/erasure.py,
+# so numpy is the only maths dependency -- no external EC library.
+numpy>=1.26.4

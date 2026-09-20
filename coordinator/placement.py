@@ -41,6 +41,34 @@ def select_replicas(ring, object_name: str, nodes: dict, factor: int = REPLICATI
     return targets
 
 
+def ec_plan_write(ring, object_name: str, nodes: dict, total_shards: int) -> list:
+    """Distinct healthy nodes to spread an object's shards across, best first.
+
+    Unlike replication there is no stand-in: every shard is different, so a node
+    that can't take shard 4 can't cover for it by holding someone else's. If the
+    cluster is too small to place all of them the leftover shards go unwritten
+    and the EC repair pass rebuilds them later.
+    """
+    preference = ring.get_nodes(object_name, count=len(nodes))
+    healthy = [node_id for node_id in preference if nodes[node_id].state == NodeState.HEALTHY]
+    return healthy[:total_shards]
+
+
+def repair_candidates(ring, object_name: str, nodes: dict, exclude) -> list:
+    """Healthy nodes that could take a new copy or shard, most preferred first.
+
+    Ring order matters here even though any healthy node would do: it pulls
+    repaired copies back towards the placement the ring would have chosen, so
+    the cluster doesn't drift further out of shape with every failure.
+    """
+    preference = ring.get_nodes(object_name, count=len(nodes))
+    return [
+        node_id
+        for node_id in preference
+        if nodes[node_id].state == NodeState.HEALTHY and node_id not in exclude
+    ]
+
+
 def read_order(ring, object_name: str, nodes: dict) -> list:
     """Nodes to try on a GET, best first.
 

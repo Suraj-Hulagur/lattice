@@ -8,3 +8,6 @@ data/node*/
 # Local env
 .venv/
 venv/
+
+# Scratch fixtures made by hand for curl testing
+*_test.txt
