@@ -1,0 +1,10 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Storage node contents -- produced by running the cluster, not source
+data/node*/
+
+# Local env
+.venv/
+venv/
