@@ -11,3 +11,6 @@ venv/
 
 # Scratch fixtures made by hand for curl testing
 *_test.txt
+
+# Benchmark output -- regenerate with `python benchmark/run.py`
+benchmark/results.csv

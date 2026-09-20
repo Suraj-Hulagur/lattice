@@ -1,5 +1,6 @@
 import os
 import shutil
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -23,7 +24,23 @@ def create_app(data_dir: str = None) -> FastAPI:
     data_dir = data_dir or DATA_DIR
     os.makedirs(data_dir, exist_ok=True)
 
-    app = FastAPI(title="LATTICE Storage Node")
+    # Built once and kept: constructing an httpx client loads the system trust
+    # store, which costs far more than the ping it is being used for, and the
+    # coordinator asks for a peer check on every sweep during a failure.
+    peer_client = {"client": None}
+
+    def peers() -> httpx.AsyncClient:
+        if peer_client["client"] is None or peer_client["client"].is_closed:
+            peer_client["client"] = httpx.AsyncClient(timeout=VERIFY_TIMEOUT)
+        return peer_client["client"]
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        yield
+        if peer_client["client"] is not None:
+            await peer_client["client"].aclose()
+
+    app = FastAPI(title="LATTICE Storage Node", lifespan=lifespan)
 
     def _object_path(object_name: str) -> str:
         """Resolve an object name to a path inside `data_dir`, or reject it.
@@ -59,8 +76,7 @@ def create_app(data_dir: str = None) -> FastAPI:
         """
         url = f"http://{target}/ping"
         try:
-            async with httpx.AsyncClient(timeout=VERIFY_TIMEOUT) as client:
-                response = await client.get(url)
+            response = await peers().get(url)
             return {"target": target, "reachable": response.status_code == 200}
         except Exception as e:
             return {"target": target, "reachable": False, "error": str(e)}

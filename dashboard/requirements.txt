@@ -1,0 +1,9 @@
+# The dashboard runs on the host, not inside docker-compose, so it keeps its
+# own dependencies out of the coordinator and node images.
+#
+#   pip install -r dashboard/requirements.txt
+#   streamlit run dashboard/app.py
+
+streamlit>=1.49
+pandas>=2.2
+requests>=2.32

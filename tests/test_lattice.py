@@ -95,6 +95,10 @@ def cluster(tmp_path, monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", _RoutedClient)
 
+    # The coordinator caches one client; each test runs in its own event loop
+    # and its own patched httpx, so the cached one must not survive.
+    coord._node_client = None
+
     coord.placement_index.clear()
     coord.ec_placement_index.clear()
     hints._hints.clear()
@@ -265,6 +269,72 @@ def test_read_fails_cleanly_below_four_shards(cluster):
             read = await client.get("/objects/coded.bin")
             assert read.status_code == 503
             assert "need 4" in read.json()["detail"]
+
+    run(body)
+
+
+# ------------------------------------ phases 13/14: what the tools depend on
+
+
+def test_object_catalogue_reports_protection(cluster):
+    """The dashboard lists objects from here, so it has to tell the truth."""
+
+    async def body():
+        async with coordinator() as client:
+            await put_object(client, "plain.bin", os.urandom(1024))
+            await put_object(client, "coded.bin", os.urandom(4096), mode="ec")
+
+            catalogue = (await client.get("/objects")).json()
+            assert catalogue["count"] == 2
+            assert catalogue["at_risk"] == []
+
+            by_name = {o["object_name"]: o for o in catalogue["objects"]}
+            assert by_name["plain.bin"]["mode"] == "replication"
+            assert by_name["plain.bin"]["live_copies"] == 3
+            assert by_name["coded.bin"]["mode"] == "erasure_coding"
+            assert by_name["coded.bin"]["live_copies"] == TOTAL_SHARDS
+
+            # Losing a shard holder has to show up as an at-risk object.
+            cluster.fail(by_name["coded.bin"]["held_by"][0])
+            catalogue = (await client.get("/objects")).json()
+            assert catalogue["at_risk"] == ["coded.bin"]
+            assert not [o for o in catalogue["objects"]
+                        if o["object_name"] == "coded.bin"][0]["fully_protected"]
+
+    run(body)
+
+
+def test_simulate_missing_forces_a_degraded_read(cluster):
+    """The benchmark measures reconstruction with this, so it must really degrade.
+
+    Killing nodes to force a degraded read races the repair pass, which heals
+    the object within a sweep.
+    """
+
+    async def body():
+        data = os.urandom(4096)
+        async with coordinator() as client:
+            await put_object(client, "coded.bin", data, mode="ec")
+
+            read = await client.get("/objects/coded.bin", params={"simulate_missing": 2})
+            assert read.status_code == 200
+            assert read.content == data
+            assert read.headers["x-degraded-read"] == "true"
+            assert read.headers["x-shards-available"] == str(DATA_SHARDS)
+
+            # Nothing actually failed, so the object is still fully protected.
+            assert (await placement_of(client, "coded.bin"))["fully_protected"] is True
+
+            too_many = await client.get(
+                "/objects/coded.bin", params={"simulate_missing": 3}
+            )
+            assert too_many.status_code == 400
+
+            await put_object(client, "plain.bin", data)
+            wrong_mode = await client.get(
+                "/objects/plain.bin", params={"simulate_missing": 1}
+            )
+            assert wrong_mode.status_code == 400
 
     run(body)
 

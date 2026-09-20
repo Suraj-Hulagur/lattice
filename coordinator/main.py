@@ -23,10 +23,41 @@ from common.erasure import DATA_SHARDS, PARITY_SHARDS, TOTAL_SHARDS
 ec_placement_index = {}
 
 
+# How long the coordinator waits on any single node call.
+NODE_TIMEOUT = 10.0
+
+# One HTTP client for every call the coordinator makes to a node.
+#
+# Building an httpx.AsyncClient eagerly loads the system trust store, which
+# costs roughly 280ms on Windows -- two hundred times the 1-2ms a localhost
+# request actually takes. A client per request made that setup the dominant
+# cost of every read and write in the cluster. Reusing one also keeps the
+# connections to the nodes pooled instead of reconnecting each time.
+_node_client = None
+
+
+def node_client() -> httpx.AsyncClient:
+    """The shared client, created on first use inside the running loop."""
+    global _node_client
+    if _node_client is None or _node_client.is_closed:
+        _node_client = httpx.AsyncClient(timeout=NODE_TIMEOUT)
+    return _node_client
+
+
+async def close_node_client():
+    global _node_client
+    if _node_client is not None and not _node_client.is_closed:
+        await _node_client.aclose()
+    _node_client = None
+
+
 async def after_sweep_pass():
     """Run after each health sweep: handoff + repair."""
+    client = node_client()
     await handoff_pass()
-    await repair_replicas(nodes, placement_index, ring, placement.REPLICATION_FACTOR)
+    await repair_replicas(
+        nodes, placement_index, ring, placement.REPLICATION_FACTOR, client
+    )
     await repair_ec_shards()
 
 
@@ -44,6 +75,7 @@ async def lifespan(app: FastAPI):
             await detector
         except asyncio.CancelledError:
             pass
+        await close_node_client()
 
 
 app = FastAPI(title="LATTICE Coordinator", lifespan=lifespan)
@@ -116,8 +148,7 @@ async def verify_node(node_id: str):
     if node_id not in nodes:
         raise HTTPException(status_code=404, detail="Node not found")
 
-    async with httpx.AsyncClient() as client:
-        verdict = await health.verify_failure(nodes[node_id], nodes, client)
+    verdict = await health.verify_failure(nodes[node_id], nodes, node_client())
     return verdict
 
 
@@ -131,12 +162,10 @@ async def test_ping(node_id: str):
     url = f"http://{node_endpoint(node)}/ping"
 
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(url)
-            if response.status_code == 200:
-                return {"status": "success", "node": node_id, "response": response.json()}
-            else:
-                return {"status": "failed", "node": node_id, "status_code": response.status_code}
+        response = await node_client().get(url, timeout=2.0)
+        if response.status_code == 200:
+            return {"status": "success", "node": node_id, "response": response.json()}
+        return {"status": "failed", "node": node_id, "status_code": response.status_code}
     except Exception as e:
         return {"status": "error", "node": node_id, "detail": str(e)}
 
@@ -210,12 +239,12 @@ async def handoff_pass():
     if not ready:
         return
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for owner in ready:
-            pending = hints.for_owner(owner)
-            print(f"[HANDOFF] {owner} is back, {len(pending)} replica(s) to deliver")
-            for object_name, holder in pending:
-                await _handoff_object(client, object_name, holder, owner)
+    client = node_client()
+    for owner in ready:
+        pending = hints.for_owner(owner)
+        print(f"[HANDOFF] {owner} is back, {len(pending)} replica(s) to deliver")
+        for object_name, holder in pending:
+            await _handoff_object(client, object_name, holder, owner)
 
 
 @app.get("/hints")
@@ -343,18 +372,18 @@ async def _forget_other_mode(object_name: str, keeping: str):
     nothing will ever delete. Called only after the new write has succeeded, so
     a rejected write never destroys what was already there.
     """
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        if keeping == EC and object_name in placement_index:
-            for node_id in placement_index.pop(object_name):
-                await _delete_quietly(client, node_id, object_name)
-            # Hints point at replicas that no longer exist.
-            hints.drop_object(object_name)
-            print(f"[MODE] {object_name}: replicated copies dropped, now EC")
-        elif keeping == REPLICATION and object_name in ec_placement_index:
-            shards = ec_placement_index.pop(object_name)["shards"]
-            for shard_index, node_id in shards.items():
-                await _delete_quietly(client, node_id, _shard_name(object_name, shard_index))
-            print(f"[MODE] {object_name}: shards dropped, now replicated")
+    client = node_client()
+    if keeping == EC and object_name in placement_index:
+        for node_id in placement_index.pop(object_name):
+            await _delete_quietly(client, node_id, object_name)
+        # Hints point at replicas that no longer exist.
+        hints.drop_object(object_name)
+        print(f"[MODE] {object_name}: replicated copies dropped, now EC")
+    elif keeping == REPLICATION and object_name in ec_placement_index:
+        shards = ec_placement_index.pop(object_name)["shards"]
+        for shard_index, node_id in shards.items():
+            await _delete_quietly(client, node_id, _shard_name(object_name, shard_index))
+        print(f"[MODE] {object_name}: shards dropped, now replicated")
 
 
 # ============================== WRITE PATHS ==============================
@@ -369,10 +398,10 @@ async def _store_replicated(object_name: str, payload: bytes):
             detail=f"Only {len(targets)} healthy nodes available, need {placement.WRITE_QUORUM}",
         )
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        results = await asyncio.gather(
-            *(_put_replica(client, node_id, object_name, payload) for node_id in targets)
-        )
+    client = node_client()
+    results = await asyncio.gather(
+        *(_put_replica(client, node_id, object_name, payload) for node_id in targets)
+    )
 
     stored = [node_id for node_id, ok in zip(targets, results) if ok]
     failed = [node_id for node_id, ok in zip(targets, results) if not ok]
@@ -422,13 +451,13 @@ async def _store_ec(object_name: str, payload: bytes):
     # Shard i goes to targets[i]. With fewer than 6 healthy nodes the tail of
     # the shard list simply isn't placed; repair_ec_shards() rebuilds those the
     # moment there's somewhere to put them.
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        results = await asyncio.gather(
-            *(
-                _put_shard(client, node_id, object_name, shard_index, shards[shard_index])
-                for shard_index, node_id in enumerate(targets)
-            )
+    client = node_client()
+    results = await asyncio.gather(
+        *(
+            _put_shard(client, node_id, object_name, shard_index, shards[shard_index])
+            for shard_index, node_id in enumerate(targets)
         )
+    )
 
     shard_map = {
         shard_index: node_id
@@ -529,24 +558,24 @@ async def _fetch_replicated(object_name: str):
         raise HTTPException(status_code=503, detail="No storage nodes available")
 
     attempted = []
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for node_id in candidates:
-            attempted.append(node_id)
-            url = f"http://{node_endpoint(nodes[node_id])}/data/{object_name}"
-            try:
-                response = await client.get(url)
-            except Exception:
-                continue  # node unreachable -- fall through to the next replica
-            if response.status_code == 200:
-                return Response(
-                    content=response.content,
-                    media_type="application/octet-stream",
-                    headers={
-                        "Content-Disposition": f"attachment; filename={object_name}",
-                        "X-Storage-Mode": REPLICATION,
-                        "X-Served-By": node_id,
-                    },
-                )
+    client = node_client()
+    for node_id in candidates:
+        attempted.append(node_id)
+        url = f"http://{node_endpoint(nodes[node_id])}/data/{object_name}"
+        try:
+            response = await client.get(url)
+        except Exception:
+            continue  # node unreachable -- fall through to the next replica
+        if response.status_code == 200:
+            return Response(
+                content=response.content,
+                media_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": f"attachment; filename={object_name}",
+                    "X-Storage-Mode": REPLICATION,
+                    "X-Served-By": node_id,
+                },
+            )
 
     raise HTTPException(
         status_code=404,
@@ -554,12 +583,17 @@ async def _fetch_replicated(object_name: str):
     )
 
 
-async def _fetch_ec(object_name: str):
+async def _fetch_ec(object_name: str, simulate_missing: int = 0):
     """Read an EC object, reconstructing from whatever shards answer.
 
     A full read collects all 6 shards and uses the 4 data shards as they are.
     A degraded read -- any shard missing because its node is down or was never
     written -- solves for the original data from any 4 of the 6.
+
+    `simulate_missing` ignores that many placed shards on purpose. Measuring
+    the real cost of reconstruction is otherwise a race: stopping nodes to
+    force a degraded read also wakes the repair pass, which heals the object
+    within a sweep and turns the next read back into a full one.
     """
     ec_info = ec_placement_index[object_name]
     shard_map = ec_info["shards"]
@@ -568,14 +602,18 @@ async def _fetch_ec(object_name: str):
     # Every shard is fetched at once: a degraded read is only as slow as the
     # slowest surviving node, not the sum of six sequential hops.
     placed = list(shard_map.items())
+    if simulate_missing:
+        # Drop from the front, which takes out data shards before parity and so
+        # always forces a matrix inversion rather than a plain concatenation.
+        placed = placed[simulate_missing:]
     fetched = [None] * TOTAL_SHARDS
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        results = await asyncio.gather(
-            *(
-                _get_shard(client, node_id, object_name, shard_index)
-                for shard_index, node_id in placed
-            )
+    client = node_client()
+    results = await asyncio.gather(
+        *(
+            _get_shard(client, node_id, object_name, shard_index)
+            for shard_index, node_id in placed
         )
+    )
     for (shard_index, _), data in zip(placed, results):
         fetched[shard_index] = data
 
@@ -611,11 +649,71 @@ async def _fetch_ec(object_name: str):
     )
 
 
+@app.get("/objects")
+def list_objects():
+    """Every object the coordinator knows about, and how well protected it is.
+
+    The index is in memory, so this is what this coordinator has seen since it
+    started rather than a scan of the cluster. It is what the dashboard lists.
+    """
+    catalogue = []
+
+    for object_name, holders in sorted(placement_index.items()):
+        live = [n for n in holders if nodes[n].state != NodeState.FAILED]
+        catalogue.append(
+            {
+                "object_name": object_name,
+                "mode": REPLICATION,
+                "held_by": holders,
+                "live_copies": len(live),
+                "target_copies": placement.REPLICATION_FACTOR,
+                "readable": bool(live),
+                "fully_protected": len(live) >= placement.REPLICATION_FACTOR,
+            }
+        )
+
+    for object_name, ec_info in sorted(ec_placement_index.items()):
+        shard_map = ec_info["shards"]
+        live = [
+            i for i, n in shard_map.items() if nodes[n].state != NodeState.FAILED
+        ]
+        catalogue.append(
+            {
+                "object_name": object_name,
+                "mode": EC,
+                "held_by": [shard_map[i] for i in sorted(shard_map)],
+                "live_copies": len(live),
+                "target_copies": TOTAL_SHARDS,
+                "readable": len(live) >= DATA_SHARDS,
+                "fully_protected": len(live) == TOTAL_SHARDS,
+                "size": ec_info["original_size"],
+            }
+        )
+
+    return {
+        "count": len(catalogue),
+        "objects": catalogue,
+        "at_risk": [
+            o["object_name"] for o in catalogue if not o["fully_protected"]
+        ],
+    }
+
+
 @app.get("/objects/{object_name}")
-async def download_object(object_name: str):
+async def download_object(object_name: str, simulate_missing: int = 0):
     """Download an object. The mode it was written in is looked up, not asked for."""
     if stored_mode(object_name) == EC:
-        return await _fetch_ec(object_name)
+        if not 0 <= simulate_missing <= PARITY_SHARDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"simulate_missing must be between 0 and {PARITY_SHARDS}",
+            )
+        return await _fetch_ec(object_name, simulate_missing=simulate_missing)
+    if simulate_missing:
+        raise HTTPException(
+            status_code=400,
+            detail="simulate_missing only applies to erasure coded objects",
+        )
     return await _fetch_replicated(object_name)
 
 
@@ -704,96 +802,96 @@ async def repair_ec_shards():
 
     repairs = []
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for object_name, ec_info in list(ec_placement_index.items()):
-            shard_map = ec_info["shards"]
+    client = node_client()
+    for object_name, ec_info in list(ec_placement_index.items()):
+        shard_map = ec_info["shards"]
 
-            lost = [
-                shard_index
-                for shard_index in range(TOTAL_SHARDS)
-                if shard_index not in shard_map or shard_map[shard_index] in failed_nodes
-            ]
-            if not lost:
+        lost = [
+            shard_index
+            for shard_index in range(TOTAL_SHARDS)
+            if shard_index not in shard_map or shard_map[shard_index] in failed_nodes
+        ]
+        if not lost:
+            continue
+
+        # Check for somewhere to put the rebuilt shards before reading the
+        # survivors -- otherwise a permanently under-placed object would
+        # re-read 4 shards off the cluster on every 5-second sweep.
+        spares = placement.repair_candidates(
+            ring, object_name, nodes, exclude=set(shard_map.values())
+        )
+        if not spares:
+            continue
+
+        survivors = [None] * TOTAL_SHARDS
+        for shard_index, node_id in shard_map.items():
+            if shard_index in lost:
                 continue
-
-            # Check for somewhere to put the rebuilt shards before reading the
-            # survivors -- otherwise a permanently under-placed object would
-            # re-read 4 shards off the cluster on every 5-second sweep.
-            spares = placement.repair_candidates(
-                ring, object_name, nodes, exclude=set(shard_map.values())
+            survivors[shard_index] = await _get_shard(
+                client, node_id, object_name, shard_index
             )
+
+        available = sum(1 for s in survivors if s is not None)
+        if available < DATA_SHARDS:
+            print(
+                f"[EC-REPAIR] {object_name}: only {available} shard(s) readable, "
+                f"need {DATA_SHARDS} -- cannot rebuild"
+            )
+            continue
+
+        rebuilt = []
+        for shard_index in lost:
             if not spares:
-                continue
-
-            survivors = [None] * TOTAL_SHARDS
-            for shard_index, node_id in shard_map.items():
-                if shard_index in lost:
-                    continue
-                survivors[shard_index] = await _get_shard(
-                    client, node_id, object_name, shard_index
-                )
-
-            available = sum(1 for s in survivors if s is not None)
-            if available < DATA_SHARDS:
-                print(
-                    f"[EC-REPAIR] {object_name}: only {available} shard(s) readable, "
-                    f"need {DATA_SHARDS} -- cannot rebuild"
-                )
-                continue
-
-            rebuilt = []
-            for shard_index in lost:
-                if not spares:
-                    print(
-                        f"[EC-REPAIR] {object_name} {_shard_label(shard_index)}: "
-                        "no spare healthy node"
-                    )
-                    break
-
-                try:
-                    shard = reconstruct_shard(survivors, shard_index)
-                except Exception as e:
-                    print(
-                        f"[EC-REPAIR] {object_name} {_shard_label(shard_index)}: "
-                        f"reconstruct failed: {e}"
-                    )
-                    continue
-
-                target = spares.pop(0)
-                if not await _put_shard(client, target, object_name, shard_index, shard):
-                    print(
-                        f"[EC-REPAIR] {object_name} {_shard_label(shard_index)}: "
-                        f"write to {target} failed"
-                    )
-                    continue
-
-                # The old holder may still have a stale copy of this shard on
-                # disk; it is failed, so there's nobody to ask. Harmless -- the
-                # shard map no longer points at it.
-                previous = shard_map.get(shard_index)
-                shard_map[shard_index] = target
-                rebuilt.append(
-                    {
-                        "shard": _shard_label(shard_index),
-                        "index": shard_index,
-                        "lost_from": previous,
-                        "rebuilt_on": target,
-                    }
-                )
                 print(
                     f"[EC-REPAIR] {object_name} {_shard_label(shard_index)}: "
-                    f"{previous or 'unwritten'} -> {target}"
+                    "no spare healthy node"
                 )
+                break
 
-            if rebuilt:
-                repairs.append(
-                    {
-                        "object": object_name,
-                        "rebuilt": rebuilt,
-                        "shards_held": len(shard_map),
-                        "scheme": f"{DATA_SHARDS}+{PARITY_SHARDS}",
-                    }
+            try:
+                shard = reconstruct_shard(survivors, shard_index)
+            except Exception as e:
+                print(
+                    f"[EC-REPAIR] {object_name} {_shard_label(shard_index)}: "
+                    f"reconstruct failed: {e}"
                 )
+                continue
+
+            target = spares.pop(0)
+            if not await _put_shard(client, target, object_name, shard_index, shard):
+                print(
+                    f"[EC-REPAIR] {object_name} {_shard_label(shard_index)}: "
+                    f"write to {target} failed"
+                )
+                continue
+
+            # The old holder may still have a stale copy of this shard on
+            # disk; it is failed, so there's nobody to ask. Harmless -- the
+            # shard map no longer points at it.
+            previous = shard_map.get(shard_index)
+            shard_map[shard_index] = target
+            rebuilt.append(
+                {
+                    "shard": _shard_label(shard_index),
+                    "index": shard_index,
+                    "lost_from": previous,
+                    "rebuilt_on": target,
+                }
+            )
+            print(
+                f"[EC-REPAIR] {object_name} {_shard_label(shard_index)}: "
+                f"{previous or 'unwritten'} -> {target}"
+            )
+
+        if rebuilt:
+            repairs.append(
+                {
+                    "object": object_name,
+                    "rebuilt": rebuilt,
+                    "shards_held": len(shard_map),
+                    "scheme": f"{DATA_SHARDS}+{PARITY_SHARDS}",
+                }
+            )
 
     if repairs:
         print(f"[EC-REPAIR] Rebuilt shards for {len(repairs)} object(s)")
@@ -804,7 +902,7 @@ async def repair_ec_shards():
 async def trigger_repair():
     """Force a repair sweep for both replicated and EC objects."""
     rep_repairs = await repair_replicas(
-        nodes, placement_index, ring, placement.REPLICATION_FACTOR
+        nodes, placement_index, ring, placement.REPLICATION_FACTOR, node_client()
     )
     ec_repairs = await repair_ec_shards()
     return {
