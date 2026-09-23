@@ -66,17 +66,20 @@ from each object's real placement. Degraded reads are forced with
 `?simulate_missing=2` rather than by killing nodes, because killing nodes also
 wakes the repair pass, which heals the object before the next read lands.
 
-## Watching it live
+## Watching it live & running benchmarks from the UI
 
 ```bash
+docker compose up -d --build         # start the 8-node LATTICE cluster
 pip install -r dashboard/requirements.txt
 streamlit run dashboard/app.py
 ```
 
 Runs on the host, outside compose, and talks to the coordinator over HTTP like
-any other client. Node states as the failure detector sees them, what each
-object's protection looks like right now, upload in either mode, and the
-benchmark CSV as charts.
+any other client:
+- **Cluster tab**: Node states as the failure detector sees them, peer verdicts, and hinted handoff.
+- **Objects tab**: Object catalogue, placement inspector, interactive download with simulated missing shards, and upload.
+- **Benchmark tab**: Run a fresh benchmark against the live cluster directly with the **"Run Benchmark"** button (configuring sizes, modes, and reps), or inspect existing CSV results and performance comparison charts.
+
 
 ## Tests
 
