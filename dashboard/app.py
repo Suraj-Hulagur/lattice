@@ -271,8 +271,8 @@ def objects_pane(api, health):
                 "Save file", response.content, file_name=chosen, key="save-object"
             )
 
-    st.markdown("#### Upload")
-    upload = st.file_uploader("File", key="upload-file")
+    st.markdown("#### Upload Files to LATTICE (MP3, MP4, PDF, etc.)")
+    upload = st.file_uploader("Choose a file to store in the cluster", key="upload-file")
     mode_label = st.radio(
         "Storage mode",
         ["replication", "ec"],
@@ -368,7 +368,7 @@ def benchmark_pane(results_path, base_url=DEFAULT_COORDINATOR):
                     status_box.update(label="Benchmark failed!", state="error", expanded=True)
                     st.error(f"Benchmark failed: {e}")
 
-    uploaded = st.file_uploader("Or load a CSV", type="csv", key="bench-csv")
+    uploaded = st.file_uploader("Load past benchmark results (CSV ONLY, DO NOT UPLOAD MEDIA HERE)", type="csv", key="bench-csv")
     if uploaded is not None:
         frame = pd.read_csv(io.BytesIO(uploaded.getvalue()))
         st.caption("Displaying measurements from uploaded CSV.")
