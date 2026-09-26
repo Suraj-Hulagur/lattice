@@ -317,6 +317,67 @@ def benchmark_pane(results_path, base_url=DEFAULT_COORDINATOR):
         "Execute a fresh benchmark against the running LATTICE cluster or inspect saved/uploaded results."
     )
 
+    # ---- Quick file benchmark: upload any file and compare modes ----
+    st.markdown("##### Benchmark Your File")
+    st.caption("Upload any file (MP3, PDF, image, video) and see how fast Replication vs Erasure Coding stores and reads it.")
+    bench_file = st.file_uploader("Choose a file to benchmark", key="bench-any-file")
+    if bench_file is not None and st.button("Benchmark this file", key="do-file-bench"):
+        payload = bench_file.getvalue()
+        file_size = len(payload)
+        api = Coordinator(base_url)
+        results = []
+
+        for mode in ["replication", "ec"]:
+            obj_name = f"bench-{mode}-{bench_file.name}"
+            # Time the write
+            t0 = time.time()
+            try:
+                api.upload(obj_name, payload, mode)
+                write_ms = (time.time() - t0) * 1000
+            except Exception as e:
+                st.error(f"Write failed ({mode}): {e}")
+                continue
+
+            # Time the read
+            t0 = time.time()
+            try:
+                resp = api.download(obj_name)
+                read_ms = (time.time() - t0) * 1000
+                verified = resp.content == payload
+            except Exception as e:
+                st.error(f"Read failed ({mode}): {e}")
+                continue
+
+            results.append({
+                "Mode": mode,
+                "Write (ms)": round(write_ms, 1),
+                "Read (ms)": round(read_ms, 1),
+                "Verified": "✅" if verified else "❌",
+                "Storage": f"{file_size * 3:,} bytes (3.0x)" if mode == "replication" else f"{file_size * 3 // 2:,} bytes (1.5x)",
+            })
+
+        if results:
+            st.markdown(f"**Results for `{bench_file.name}` ({file_size:,} bytes)**")
+            st.dataframe(pd.DataFrame(results), hide_index=True, use_container_width=True)
+
+            # Side-by-side bar chart
+            chart_data = pd.DataFrame(results)
+            write_chart = alt.Chart(chart_data).mark_bar().encode(
+                x=alt.X("Mode:N"),
+                y=alt.Y("Write (ms):Q", title="Milliseconds"),
+                color="Mode:N",
+            ).properties(title="Write Speed", height=250)
+            read_chart = alt.Chart(chart_data).mark_bar().encode(
+                x=alt.X("Mode:N"),
+                y=alt.Y("Read (ms):Q", title="Milliseconds"),
+                color="Mode:N",
+            ).properties(title="Read Speed", height=250)
+            c1, c2 = st.columns(2)
+            c1.altair_chart(write_chart, use_container_width=True)
+            c2.altair_chart(read_chart, use_container_width=True)
+
+    st.markdown("---")
+
     with st.expander("Benchmark Configuration & Controls", expanded=True):
         col1, col2, col3 = st.columns([2, 2, 1])
         with col1:
