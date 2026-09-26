@@ -14,6 +14,7 @@ import os
 import sys
 import time
 
+import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
@@ -284,8 +285,28 @@ def objects_pane(api, health):
         payload = upload.getvalue()
         try:
             result = api.upload(upload.name, payload, mode_label)
-            st.success(f"{upload.name} stored ({len(payload)} bytes)")
-            st.json(result)
+            mode_used = result.get("mode", mode_label)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("File", upload.name)
+            c2.metric("Size", f"{len(payload):,} bytes")
+            c3.metric("Mode", mode_used)
+            if "replicas" in result:
+                nodes = result["replicas"]
+                st.success(
+                    f"Stored **{len(nodes)} copies** on: {', '.join(nodes)}"
+                )
+            elif "shards" in result:
+                shards = result["shards"]
+                if isinstance(shards, dict):
+                    st.success(
+                        f"Stored **{len(shards)} shards** across: {', '.join(shards.values())}"
+                    )
+                else:
+                    st.success(f"Stored **{len(shards)} shards** across the cluster")
+            else:
+                st.success(f"{upload.name} stored successfully")
+            with st.expander("Raw API response"):
+                st.json(result)
         except requests.HTTPError as e:
             st.error(f"{e.response.status_code}: {e.response.text}")
 
@@ -368,10 +389,15 @@ def benchmark_pane(results_path, base_url=DEFAULT_COORDINATOR):
                     status_box.update(label="Benchmark failed!", state="error", expanded=True)
                     st.error(f"Benchmark failed: {e}")
 
-    uploaded = st.file_uploader("Load past benchmark results (CSV ONLY, DO NOT UPLOAD MEDIA HERE)", type="csv", key="bench-csv")
-    if uploaded is not None:
-        frame = pd.read_csv(io.BytesIO(uploaded.getvalue()))
-        st.caption("Displaying measurements from uploaded CSV.")
+    frame = None
+    with st.expander("Load a different benchmark CSV (advanced)"):
+        uploaded = st.file_uploader("Upload a benchmark results CSV", type="csv", key="bench-csv")
+        if uploaded is not None:
+            frame = pd.read_csv(io.BytesIO(uploaded.getvalue()))
+            st.caption("Displaying measurements from uploaded CSV.")
+
+    if frame is not None:
+        pass  # already loaded above
     elif os.path.exists(results_path):
         frame = pd.read_csv(results_path)
         fresh_time = st.session_state.get("benchmark_fresh_time")
@@ -422,10 +448,13 @@ def benchmark_pane(results_path, base_url=DEFAULT_COORDINATOR):
         if subset.empty:
             continue
         st.markdown(f"**{operation.replace('_', ' ')}** -- {caption}")
-        st.bar_chart(
-            subset.pivot(index="size", columns="mode", values="ms"),
-            y_label="median ms",
-        )
+        chart = alt.Chart(subset).mark_bar().encode(
+            x=alt.X("size:N", title="File Size"),
+            xOffset="mode:N",
+            y=alt.Y("ms:Q", title="Median ms"),
+            color=alt.Color("mode:N", legend=alt.Legend(title="Mode")),
+        ).properties(height=300)
+        st.altair_chart(chart, use_container_width=True)
 
     st.markdown("**Storage overhead** -- bytes held per byte of object.")
     overhead = (
@@ -434,10 +463,13 @@ def benchmark_pane(results_path, base_url=DEFAULT_COORDINATOR):
     overhead["size"] = overhead["size_bytes"].apply(
         lambda b: f"{b // 1024}KB" if b < 1024 * 1024 else f"{b // (1024 * 1024)}MB"
     )
-    st.bar_chart(
-        overhead.pivot(index="size", columns="mode", values="overhead_ratio"),
-        y_label="x original size",
-    )
+    chart = alt.Chart(overhead).mark_bar().encode(
+        x=alt.X("size:N", title="File Size"),
+        xOffset="mode:N",
+        y=alt.Y("overhead_ratio:Q", title="x original size"),
+        color=alt.Color("mode:N", legend=alt.Legend(title="Mode")),
+    ).properties(height=300)
+    st.altair_chart(chart, use_container_width=True)
 
     if not frame["verified"].all():
         st.error("Some measured reads did not match what was written.")
